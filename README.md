@@ -1,0 +1,1 @@
+# Derin-renme-ile-Zat-re-Tespiti
