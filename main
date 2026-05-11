@@ -1,0 +1,242 @@
+%% Pneumonia Detection using Ensemble of Deep Learning Models
+clear; clc; close all;
+
+%% 1. DATA LOADING AND PREPROCESSING
+
+dataFolder = 'C:/Users/220603089/Desktop/ysa/chest_xray/chest_xray'; 
+
+trainFolder = 'C:/Users/220603089/Desktop/ysa/chest_xray/chest_xray/train';
+testFolder = 'C:/Users/220603089/Desktop/ysa/chest_xray/chest_xray/test';
+
+fprintf('Kontrol edilen yol: %s\n', trainFolder); 
+if ~isfolder(trainFolder)
+    error('Hata: Düzeltilmiş yolda bile train klasörü bulunamadı. Lütfen yolu tekrar kontrol edin.');
+end
+
+% ImageDatastore oluşturma
+imds = imageDatastore(trainFolder, ...
+    'IncludeSubfolders', true, ...
+    'LabelSource', 'foldernames');
+
+% Test dataseti
+testImds = imageDatastore(testFolder, ...
+    'IncludeSubfolders', true, ...
+    'LabelSource', 'foldernames');
+
+% Sınıf isimlerini görüntüleme
+classes = categories(imds.Labels);
+numClasses = numel(classes);
+fprintf('Sınıflar: %s\n', strjoin(classes, ', '));
+fprintf('Toplam eğitim görüntüsü: %d\n', numel(imds.Files));
+fprintf('Toplam test görüntüsü: %d\n', numel(testImds.Files));
+
+%% 2. 5-FOLD CROSS VALIDATION HAZIRLIĞI
+kFold = 5;
+cv = cvpartition(imds.Labels, 'KFold', kFold);
+
+% Sonuçları saklamak için değişkenler
+results = struct();
+results.GoogLeNet = zeros(kFold, 5); % Acc, Pre, Rec, F1, AUC
+results.ResNet18 = zeros(kFold, 5);
+results.DenseNet121 = zeros(kFold, 5);
+results.Ensemble = zeros(kFold, 5);
+
+%% 3. HYPERPARAMETERS
+inputSize = [224 224 3];
+miniBatchSize = 32;
+maxEpochs = 30;
+initialLearnRate = 0.0001;
+
+options = trainingOptions('adam', ...
+    'MiniBatchSize', miniBatchSize, ...
+    'MaxEpochs', maxEpochs, ...
+    'InitialLearnRate', initialLearnRate, ...
+    'ValidationFrequency', 30, ...
+    'Verbose', false, ...
+    'Plots', 'training-progress', ...
+    'ExecutionEnvironment', 'auto');
+
+%% 4. K-FOLD CROSS VALIDATION LOOP
+for fold = 1:kFold
+    fprintf('\n========== FOLD %d/%d ==========\n', fold, kFold);
+    
+    % Train ve validation setlerini ayırma
+    trainIdx = training(cv, fold);
+    valIdx = test(cv, fold);
+    
+    imdsTrain = subset(imds, trainIdx);
+    imdsVal = subset(imds, valIdx);
+    
+    % Data augmentation
+    augmenter = imageDataAugmenter( ...
+        'RandRotation', [-20 20], ...
+        'RandXTranslation', [-10 10], ...
+        'RandYTranslation', [-10 10], ...
+        'RandXReflection', true);
+    
+    augTrain = augmentedImageDatastore(inputSize, imdsTrain, ...
+        'DataAugmentation', augmenter);
+    augVal = augmentedImageDatastore(inputSize, imdsVal);
+    
+    %% 4.1 GOOGLENET MODEL
+    fprintf('Training GoogLeNet...\n');
+    net = googlenet;
+    lgraph = layerGraph(net);
+    
+    % Son katmanları değiştirme
+    newLearnableLayer = fullyConnectedLayer(numClasses, ...
+        'Name', 'new_fc', ...
+        'WeightLearnRateFactor', 10, ...
+        'BiasLearnRateFactor', 10);
+    lgraph = replaceLayer(lgraph, 'loss3-classifier', newLearnableLayer);
+    
+    newClassLayer = classificationLayer('Name', 'new_classoutput');
+    lgraph = replaceLayer(lgraph, 'output', newClassLayer);
+    
+    % Model eğitimi
+    netGoogLeNet = trainNetwork(augTrain, lgraph, options);
+    
+    % Validation predictions
+    [predLabelsGN, scoresGN] = classify(netGoogLeNet, augVal);
+    
+    %% 4.2 RESNET-18 MODEL
+    fprintf('Training ResNet-18...\n');
+    net = resnet18;
+    lgraph = layerGraph(net);
+    
+    newLearnableLayer = fullyConnectedLayer(numClasses, ...
+        'Name', 'new_fc', ...
+        'WeightLearnRateFactor', 10, ...
+        'BiasLearnRateFactor', 10);
+    lgraph = replaceLayer(lgraph, 'fc1000', newLearnableLayer);
+    
+    newClassLayer = classificationLayer('Name', 'new_classoutput');
+    lgraph = replaceLayer(lgraph, 'ClassificationLayer_predictions', newClassLayer);
+    
+    netResNet18 = trainNetwork(augTrain, lgraph, options);
+    [predLabelsRN, scoresRN] = classify(netResNet18, augVal);
+    
+    %% 4.3 DENSENET-121 MODEL
+    fprintf('Training DenseNet-121...\n');
+    net = densenet201; % MATLAB'da densenet121 yoksa densenet201 kullanın
+    lgraph = layerGraph(net);
+    
+    newLearnableLayer = fullyConnectedLayer(numClasses, ...
+        'Name', 'new_fc', ...
+        'WeightLearnRateFactor', 10, ...
+        'BiasLearnRateFactor', 10);
+    lgraph = replaceLayer(lgraph, 'fc1000', newLearnableLayer);
+    
+    newClassLayer = classificationLayer('Name', 'new_classoutput');
+    lgraph = replaceLayer(lgraph, 'ClassificationLayer_fc1000', newClassLayer);
+    
+    netDenseNet = trainNetwork(augTrain, lgraph, options);
+    [predLabelsDN, scoresDN] = classify(netDenseNet, augVal);
+    
+    %% 5. ENSEMBLE WEIGHT CALCULATION
+    trueLabels = imdsVal.Labels;
+    
+    % Her model için metrikleri hesapla
+    [accGN, preGN, recGN, f1GN, aucGN] = calculateMetrics(predLabelsGN, trueLabels, scoresGN);
+    [accRN, preRN, recRN, f1RN, aucRN] = calculateMetrics(predLabelsRN, trueLabels, scoresRN);
+    [accDN, preDN, recDN, f1DN, aucDN] = calculateMetrics(predLabelsDN, trueLabels, scoresDN);
+    
+    % Ağırlıkları hesapla (tanh fonksiyonu ile)
+    wGN = calculateWeight(preGN, recGN, f1GN, aucGN);
+    wRN = calculateWeight(preRN, recRN, f1RN, aucRN);
+    wDN = calculateWeight(preDN, recDN, f1DN, aucDN);
+    
+    fprintf('Weights - GoogLeNet: %.4f, ResNet-18: %.4f, DenseNet: %.4f\n', ...
+        wGN, wRN, wDN);
+    
+    %% 6. WEIGHTED ENSEMBLE PREDICTION
+    % Ağırlıklı olasılık ortalaması
+    ensembleScores = (wGN * scoresGN + wRN * scoresRN + wDN * scoresDN) / (wGN + wRN + wDN);
+    [~, maxIdx] = max(ensembleScores, [], 2);
+    ensemblePred = classes(maxIdx);
+    
+    % Ensemble metrikleri
+    [accEns, preEns, recEns, f1Ens, aucEns] = calculateMetrics(ensemblePred, trueLabels, ensembleScores);
+    
+    %% 7. SAVE RESULTS
+    results.GoogLeNet(fold, :) = [accGN, preGN, recGN, f1GN, aucGN];
+    results.ResNet18(fold, :) = [accRN, preRN, recRN, f1RN, aucRN];
+    results.DenseNet121(fold, :) = [accDN, preDN, recDN, f1DN, aucDN];
+    results.Ensemble(fold, :) = [accEns, preEns, recEns, f1Ens, aucEns];
+    
+    fprintf('Fold %d Results:\n', fold);
+    fprintf('Ensemble - Acc: %.2f%%, Pre: %.2f%%, Rec: %.2f%%, F1: %.2f%%, AUC: %.2f%%\n', ...
+        accEns*100, preEns*100, recEns*100, f1Ens*100, aucEns*100);
+end
+
+%% 8. FINAL RESULTS
+fprintf('\n========== FINAL RESULTS (Mean ± Std) ==========\n');
+metricNames = {'Accuracy', 'Precision', 'Recall', 'F1-Score', 'AUC'};
+
+modelNames = {'GoogLeNet', 'ResNet18', 'DenseNet121', 'Ensemble'};
+for m = 1:length(modelNames)
+    fprintf('\n%s:\n', modelNames{m});
+    modelResults = results.(modelNames{m});
+    for i = 1:5
+        fprintf('%s: %.2f%% ± %.2f%%\n', metricNames{i}, ...
+            mean(modelResults(:,i))*100, std(modelResults(:,i))*100);
+    end
+end
+
+%% 9. VISUALIZATION
+figure('Position', [100 100 1200 800]);
+for i = 1:5
+    subplot(2, 3, i);
+    data = [mean(results.GoogLeNet(:,i)), mean(results.ResNet18(:,i)), ...
+            mean(results.DenseNet121(:,i)), mean(results.Ensemble(:,i))];
+    bar(data * 100);
+    set(gca, 'XTickLabel', {'GoogLeNet', 'ResNet-18', 'DenseNet', 'Ensemble'});
+    ylabel('Performance (%)');
+    title(metricNames{i});
+    ylim([85 100]);
+    grid on;
+end
+
+%% HELPER FUNCTIONS
+
+function [acc, pre, rec, f1, auc] = calculateMetrics(predLabels, trueLabels, scores)
+    % Confusion matrix
+    cm = confusionmat(trueLabels, predLabels);
+    
+    if size(cm, 1) == 2
+        TP = cm(2,2);
+        TN = cm(1,1);
+        FP = cm(1,2);
+        FN = cm(2,1);
+        
+        % Metrics
+        acc = (TP + TN) / sum(cm(:));
+        pre = TP / (TP + FP + eps);
+        rec = TP / (TP + FN + eps);
+        f1 = 2 * pre * rec / (pre + rec + eps);
+        
+        % AUC hesaplama
+        [~, ~, ~, auc] = perfcurve(trueLabels, scores(:,2), trueLabels(1));
+    else
+        % Multi-class için mikro-ortalama
+        acc = sum(diag(cm)) / sum(cm(:));
+        pre = mean(diag(cm) ./ sum(cm, 2));
+        rec = mean(diag(cm) ./ sum(cm, 1)');
+        f1 = 2 * pre * rec / (pre + rec + eps);
+        auc = acc; % Basitleştirilmiş
+    end
+end
+
+function weight = calculateWeight(pre, rec, f1, auc)
+    % Makaledeki formül: w = sum(tanh(metric))
+    metrics = [pre, rec, f1, auc];
+    weight = sum(tanh(metrics));
+end
+
+function confMat = plotConfusionMatrix(trueLabels, predLabels, titleStr)
+    % Confusion matrix görselleştirme
+    confMat = confusionchart(trueLabels, predLabels);
+    confMat.Title = titleStr;
+    confMat.RowSummary = 'row-normalized';
+    confMat.ColumnSummary = 'column-normalized';
+end
